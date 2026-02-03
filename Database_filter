@@ -1,0 +1,278 @@
+"""
+Script unificado e otimizado para gerar New_backlog_2.xlsx a partir de New_backlog_0dados.xlsx.
+Inclui:
+✔ Atualização da coluna Valor via aba Planos
+✔ Regras de normalização, backlog, SLA, OBS e OBS PADRÃO
+✔ Correção: EqVenda = SHOWROOM → RECEPTIVO LOJA
+✔ Filtro final: manter apenas PAP DIRETO e RECEPTIVO LOJA
+"""
+
+from openpyxl import load_workbook, Workbook
+from datetime import datetime, date
+from typing import Optional
+
+ARQUIVO_BASE = "New_backlog_0dados.xlsx"
+ARQUIVO_SAIDA = "New_backlog_2.xlsx"
+
+# ---------------- util ----------------
+def parse_date_to_date(v) -> Optional[date]:
+    if v is None:
+        return None
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+
+    s = str(v).strip()
+    if s == "":
+        return None
+
+    formatos = [
+        "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"
+    ]
+    for f in formatos:
+        try:
+            return datetime.strptime(s, f).date()
+        except:
+            pass
+
+    try:
+        return datetime.strptime(s[:10], "%d/%m/%Y").date()
+    except:
+        return None
+
+
+def clean_upper(v) -> str:
+    return str(v).strip().upper() if v is not None else ""
+
+
+# ---------------- carregar base ----------------
+wb_base = load_workbook(ARQUIVO_BASE, data_only=True)
+
+ws_iman = wb_base["Base_Imanager"]
+ws_aniel = wb_base["Base_aniel"]
+ws_planos = wb_base["Planos"]
+
+# ---------------- lookup Base_aniel ----------------
+header_aniel = {}
+for c in range(1, ws_aniel.max_column + 1):
+    hv = ws_aniel.cell(1, c).value
+    if hv:
+        header_aniel[str(hv).strip().lower()] = c
+
+col_os_aniel = (
+    header_aniel.get("nº. ordem serviço") or
+    header_aniel.get("nº. ordem servico") or
+    header_aniel.get("nº. ordem")
+)
+col_status_aniel = header_aniel.get("status")
+col_resp_aniel = header_aniel.get("responsabilidade")
+col_responsavel_aniel = header_aniel.get("responsável") or header_aniel.get("responsavel")
+col_agendamento_aniel = (
+    header_aniel.get("data/hora do agendamento") or
+    header_aniel.get("data/hora do agendamento ")
+)
+
+lookup_aniel = {}
+for r in range(2, ws_aniel.max_row + 1):
+    os_ = ws_aniel.cell(r, col_os_aniel).value
+    if os_ is None:
+        continue
+    key = str(os_).strip()
+
+    lookup_aniel[key] = {
+        "status": ws_aniel.cell(r, col_status_aniel).value if col_status_aniel else None,
+        "responsabilidade": ws_aniel.cell(r, col_resp_aniel).value if col_resp_aniel else None,
+        "responsavel": ws_aniel.cell(r, col_responsavel_aniel).value if col_responsavel_aniel else None,
+        "agendamento": ws_aniel.cell(r, col_agendamento_aniel).value if col_agendamento_aniel else None
+    }
+
+# ---------------- lookup Planos ----------------
+header_planos = {}
+for c in range(1, ws_planos.max_column + 1):
+    hv = ws_planos.cell(1, c).value
+    if hv:
+        header_planos[str(hv).strip().lower()] = c
+
+col_pacote_planos = (
+    header_planos.get("nome do pacote no sistema") or
+    header_planos.get("pacote")
+)
+col_tkm = header_planos.get("tkm")
+
+lookup_planos = {}
+for r in range(2, ws_planos.max_row + 1):
+    p = ws_planos.cell(r, col_pacote_planos).value
+    t = ws_planos.cell(r, col_tkm).value
+    if p:
+        lookup_planos[clean_upper(p)] = t
+
+# ---------------- map Base_Imanager ----------------
+header_iman = {}
+for c in range(1, ws_iman.max_column + 1):
+    hv = ws_iman.cell(1, c).value
+    if hv:
+        header_iman[str(hv).strip().lower()] = c
+
+# nome EXATO informado pelo usuário → EqVenda
+col_eqvenda = header_iman.get("eqvenda")
+
+
+# ---------------- saída ----------------
+colunas_saida = [
+    "regional", "cidade", "código_assinante", "nome_assinante", "numos", "SLA",
+    "Status", "Backlog", "Responsabilidade", "Responsável", "Agendado Aniel",
+    "OBS", "OBS PADRÃO", "Data Atendimento",
+    "Vendedor", "EqVenda", "Motivo de cancelamento",
+    "Equipe Agendada", "Tecnologia", "Pacote", "valor_pct", "Valor"
+]
+
+wb_out = Workbook()
+ws_out = wb_out.active
+ws_out.title = "Backlog_Bruto"
+ws_out.append(colunas_saida)
+
+HOJE = date.today()
+
+allowed_evv = ("PAP DIRETO", "RECEPTIVO LOJA")  # linha só fica se for um destes
+
+equipe_map = {
+    ("INVIABILIDADE TECNICA", "CAIXA CHEIA", "INVIABILIDADE CAIXA CHEIA"): "INVIABILIDADE/CAIXA CHEIA",
+    ("PENDENCIA COMERCIAL", "PENDENCIA CADASTRAL"): "COMERCIAL",
+    ("PENDENCIA TECNICA", "MASSIVA", "LOGISTICA", "PRIMEIRA INSTALAÇÃO", "AGENDA FUTURA"): "CST",
+}
+
+# ---------------- processamento ----------------
+for r in range(2, ws_iman.max_row + 1):
+
+    numos_col = header_iman.get("numos") or header_iman.get("nº. ordem serviço")
+    numos_val = ws_iman.cell(r, numos_col).value
+    if numos_val is None:
+        continue
+
+    chave_numos = str(numos_val).strip()
+
+    row_vals = {}
+
+    # copiar valores base
+    for k in colunas_saida:
+        col_iman = header_iman.get(k.lower())
+        row_vals[k] = ws_iman.cell(r, col_iman).value if col_iman else None
+
+    # valor do pacote
+    pacote_raw = row_vals.get("Pacote")
+    pacote_key = clean_upper(pacote_raw)
+    valor_tkm = lookup_planos.get(pacote_key)
+
+    # lookup aniel
+    aniel = lookup_aniel.get(chave_numos)
+
+    # preencher estrutura
+    out = {k: row_vals.get(k) for k in colunas_saida}
+
+    out["numos"] = chave_numos
+    out["Valor"] = valor_tkm
+
+    # ----- EqVenda ajustes -----
+    eq_raw = ws_iman.cell(r, col_eqvenda).value if col_eqvenda else ""
+    eq_norm = clean_upper(eq_raw)
+
+    # SHOWROOM vira RECEPTIVO LOJA
+    if eq_norm == "SHOWROOM":
+        eq_norm = "RECEPTIVO LOJA"
+
+    out["EqVenda"] = eq_norm
+
+    # filtro: manter SOMENTE PAP DIRETO / RECEPTIVO LOJA
+    if eq_norm not in allowed_evv:
+        continue  # descarta linha
+
+    # ----- preencher Base_aniel -----
+    if aniel:
+        out["Status"] = aniel["status"]
+        out["Responsabilidade"] = aniel["responsabilidade"]
+        out["Responsável"] = aniel["responsavel"]
+        ag = aniel["agendamento"]
+        ag_dt = parse_date_to_date(ag)
+        out["Agendado Aniel"] = ag_dt.strftime("%d/%m/%Y") if ag_dt else None
+
+    # ----- equipe agendada -----
+    equipe_raw = out.get("Equipe Agendada")
+    equipe_norm = clean_upper(equipe_raw)
+
+    equipe_final = equipe_raw
+    for grupo, novo in equipe_map.items():
+        if equipe_norm in grupo:
+            equipe_final = novo
+            break
+
+    if clean_upper(equipe_final) not in ("CST", "COMERCIAL", "INVIABILIDADE/CAIXA CHEIA", "OS COM TÉCNICO"):
+        equipe_final = "OS COM TÉCNICO"
+
+    out["Equipe Agendada"] = equipe_final
+
+    # ----- Backlog -----
+    status_norm = clean_upper(out.get("Status"))
+    resp_norm = clean_upper(out.get("Responsável"))
+    equipe_norm = clean_upper(equipe_final)
+
+    nao_util = (equipe_norm == "INVIABILIDADE/CAIXA CHEIA")
+
+    if (not nao_util and status_norm not in ("FECHADA PRODUTIVA", "CANCELADO", "INVIABILIDADE TECNICA", "")
+        and resp_norm not in ("INVIABILIDADE TECNICA", "CAIXA CHEIA")):
+        out["Backlog"] = "util"
+    else:
+        out["Backlog"] = ""
+
+    # ----- OBS PADRÃO -----
+    obs_padrao = out.get("OBS PADRÃO")
+
+    agd_text = out.get("Agendado Aniel")
+    agd = parse_date_to_date(agd_text) if agd_text else None
+
+    if clean_upper(out["Backlog"]) == "UTIL" and resp_norm == "PENDENCIA COMERCIAL":
+        obs_padrao = "Comercial tratando"
+
+    if resp_norm == "AGENDA FUTURA":
+        if agd and agd <= HOJE:
+            obs_padrao = "Aguardando CST"
+        else:
+            obs_padrao = "Agenda Futura"
+
+    if resp_norm in ("", None) and equipe_norm == "CST":
+        obs_padrao = "Aguardando CST"
+
+    if clean_upper(out["Backlog"]) == "UTIL" and equipe_norm == "OS COM TÉCNICO":
+        obs_padrao = "Agendada"
+
+    out["OBS PADRÃO"] = obs_padrao
+
+    map_obs = {
+        "Comercial tratando": "tratativa Pablo",
+        "Aguardando CST": "tratativa cst",
+        "Agenda Futura": "tratativa cst",
+        "Agendada": "Agendada"
+    }
+    out["OBS"] = map_obs.get(obs_padrao, out.get("OBS"))
+
+    # ----- SLA -----
+    if clean_upper(out["Backlog"]) == "UTIL":
+        ag_sla = parse_date_to_date(out.get("Agendado Aniel"))
+        if ag_sla:
+            if ag_sla > HOJE:
+                out["SLA"] = 0
+            else:
+                out["SLA"] = max((HOJE - ag_sla).days, 0)
+        else:
+            out["SLA"] = ""
+    else:
+        out["SLA"] = ""
+
+    # ----- adicionar linha -----
+    linha = [out.get(k) for k in colunas_saida]
+    ws_out.append(linha)
+
+# ---------------- salvar ----------------
+wb_out.save(ARQUIVO_SAIDA)
+print("Arquivo gerado com sucesso:", ARQUIVO_SAIDA)
